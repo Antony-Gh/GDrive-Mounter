@@ -1,0 +1,7 @@
+logs/
+tools/
+dist/
+build/
+__pycache__/
+*.spec
+mount_on_startup.bat
