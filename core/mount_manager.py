@@ -42,7 +42,11 @@ class MountManager:
         ]
 
         self.process = subprocess.Popen(
-            command
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1
         )
 
         return self.process
