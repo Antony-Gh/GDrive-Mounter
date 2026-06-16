@@ -1,8 +1,8 @@
+import logging
+import queue
 import tkinter as tk
 from tkinter import ttk
 from tkinter import messagebox
-from tkinter import scrolledtext
-import logging
 import threading
 import os
 import sys
@@ -24,10 +24,15 @@ from core.mount_session import (
     MountSessionStore,
 )
 from core.updater import Updater
-from gui.tray_manager import TrayManager
+from core.logging_config import add_gui_handler
+from gui.theme import AppTheme
 
 
 logger = logging.getLogger(__name__)
+
+LOG_MAX_LINES = 300
+STATS_POLL_MS = 5000
+UI_POLL_MS = 100
 
 
 class App(tk.Tk):
@@ -41,13 +46,7 @@ class App(tk.Tk):
             f"v{CURRENT_VERSION}"
         )
 
-        self.geometry(
-            "900x750"
-        )
-
-        self.config_data = (
-            ConfigManager.load()
-        )
+        self.config_data = ConfigManager.load()
 
         self.rclone = RcloneManager()
         self.winfsp = WinFspManager()
@@ -57,8 +56,12 @@ class App(tk.Tk):
         self.mount_process = None
         self.mounting = False
         self.session_store = MountSessionStore()
-        self.tray = None
         self.stats_job = None
+        self._stats_polling = False
+        self._shutting_down = False
+        self._ui_queue = queue.SimpleQueue()
+        self._log_pending = []
+        self._last_stats = None
         self.startup_batch_file = (
             Path(__file__).resolve().parent.parent /
             "mount_on_startup.bat"
@@ -71,303 +74,525 @@ class App(tk.Tk):
 
         self.create_ui()
         self.load_settings()
-        self.apply_theme()
-        self.restore_mount_session()
-        self.check_for_updates()
-        self.start_tray()
+        add_gui_handler(self.write_log)
+        logging.getLogger().setLevel(logging.INFO)
+        self.write_log("Application started.")
+        logging.getLogger().info(
+            "Application ready."
+        )
+        self.after(0, self._drain_ui_queue)
+        self.after(300, self._restore_mount_session_async)
+        self.after(2000, self.check_for_updates)
+
+    def post_ui(self, callback, *args, **kwargs):
+
+        if self._shutting_down:
+            return
+
+        self._ui_queue.put(
+            (callback, args, kwargs)
+        )
+
+    def _drain_ui_queue(self):
+
+        if self._shutting_down:
+            return
+
+        while True:
+            try:
+                callback, args, kwargs = (
+                    self._ui_queue.get_nowait()
+                )
+            except queue.Empty:
+                break
+
+            try:
+                callback(*args, **kwargs)
+            except tk.TclError:
+                pass
+            except Exception as ex:
+                logger.debug(
+                    "UI callback failed: %s",
+                    ex
+                )
+
+        self.after(
+            UI_POLL_MS,
+            self._drain_ui_queue
+        )
+
+        if self._log_pending:
+            self._flush_log_buffer()
 
     def create_ui(self):
 
-        main = ttk.Frame(
+        self.fonts = AppTheme.apply_root(self)
+        AppTheme.build_header(self)
+
+        container = tk.Frame(
             self,
-            padding=20
+            bg=AppTheme.BG,
         )
-
-        main.pack(
+        container.pack(
             fill="both",
-            expand=True
+            expand=True,
+            padx=28,
+            pady=(0, 20),
         )
 
-        ttk.Label(
-            main,
-            text="Remote Name"
+        self._canvas = tk.Canvas(
+            container,
+            bg=AppTheme.BG,
+            highlightthickness=0,
+            bd=0,
+        )
+        self._scrollbar = ttk.Scrollbar(
+            container,
+            orient="vertical",
+            command=self._canvas.yview,
+        )
+        self._canvas.configure(
+            yscrollcommand=self._scrollbar.set
+        )
+
+        self._scrollbar.pack(
+            side="right",
+            fill="y",
+        )
+        self._canvas.pack(
+            side="left",
+            fill="both",
+            expand=True,
+        )
+
+        body = tk.Frame(
+            self._canvas,
+            bg=AppTheme.BG,
+        )
+        self._scroll_window = self._canvas.create_window(
+            (0, 0),
+            window=body,
+            anchor="nw",
+        )
+
+        def _on_body_configure(event=None):
+            self._canvas.configure(
+                scrollregion=self._canvas.bbox("all")
+            )
+
+        def _on_canvas_configure(event):
+            # keep inner content full width
+            self._canvas.itemconfigure(
+                self._scroll_window,
+                width=event.width,
+            )
+
+        body.bind(
+            "<Configure>",
+            _on_body_configure,
+        )
+        self._canvas.bind(
+            "<Configure>",
+            _on_canvas_configure,
+        )
+
+        # mouse wheel scrolling (Windows)
+        def _on_mousewheel(event):
+            self._canvas.yview_scroll(
+                int(-1 * (event.delta / 120)),
+                "units",
+            )
+
+        self._canvas.bind_all(
+            "<MouseWheel>",
+            _on_mousewheel,
+        )
+
+        body.columnconfigure(0, weight=1)
+        body.rowconfigure(4, weight=1, minsize=240)
+
+        form_outer, form_card = AppTheme.build_card(
+            body,
+            "Connection Settings"
+        )
+        form_outer.grid(
+            row=0,
+            column=0,
+            sticky="ew",
+            pady=(0, AppTheme.SECTION_PADY),
+        )
+
+        pad = AppTheme.FIELD_PADY
+
+        AppTheme.make_label(
+            form_card,
+            "Remote Name",
         ).grid(
             row=0,
             column=0,
-            sticky="w"
+            sticky="w",
+            pady=(0, 6),
         )
 
-        self.remote_var = tk.StringVar()
-
-        ttk.Entry(
-            main,
-            textvariable=self.remote_var,
-            width=50
-        ).grid(
-            row=0,
-            column=1,
-            sticky="ew"
+        self.remote_entry = tk.Entry(
+            form_card,
+            width=48
         )
-
-        ttk.Label(
-            main,
-            text="Folder URL / ID"
-        ).grid(
+        self.remote_entry.grid(
             row=1,
             column=0,
-            sticky="w"
+            columnspan=2,
+            sticky="ew",
+            pady=(0, pad)
+        )
+        AppTheme.style_entry(
+            self.remote_entry,
+            self.fonts
         )
 
-        self.folder_var = tk.StringVar()
-
-        ttk.Entry(
-            main,
-            textvariable=self.folder_var,
-            width=50
-        ).grid(
-            row=1,
-            column=1,
-            sticky="ew"
-        )
-
-        ttk.Label(
-            main,
-            text="Drive Letter"
+        AppTheme.make_label(
+            form_card,
+            "Folder URL / ID",
         ).grid(
             row=2,
             column=0,
-            sticky="w"
+            sticky="w",
+            pady=(0, 6),
         )
 
-        self.drive_var = tk.StringVar()
-
-        ttk.Entry(
-            main,
-            textvariable=self.drive_var,
-            width=10
-        ).grid(
-            row=2,
-            column=1,
-            sticky="w"
+        self.folder_entry = tk.Entry(
+            form_card,
+            width=48
         )
-
-        stats = ttk.LabelFrame(
-            main,
-            text="Mount Status",
-            padding=10
-        )
-        stats.grid(
+        self.folder_entry.grid(
             row=3,
             column=0,
             columnspan=2,
             sticky="ew",
-            pady=(10, 0)
+            pady=(0, pad)
+        )
+        AppTheme.style_entry(
+            self.folder_entry,
+            self.fonts
         )
 
-        self.status_var = tk.StringVar(
-            value="Unmounted"
-        )
-        self.speed_var = tk.StringVar(
-            value="0 B/s"
-        )
-        self.transfers_var = tk.StringVar(
-            value="0"
-        )
-        self.cache_var = tk.StringVar(
-            value="0 files"
-        )
-
-        ttk.Label(
-            stats,
-            text="State:"
+        AppTheme.make_label(
+            form_card,
+            "Drive Letter",
         ).grid(
-            row=0,
-            column=0,
-            sticky="w"
-        )
-        ttk.Label(
-            stats,
-            textvariable=self.status_var
-        ).grid(
-            row=0,
-            column=1,
-            sticky="w",
-            padx=(8, 20)
-        )
-
-        ttk.Label(
-            stats,
-            text="Speed:"
-        ).grid(
-            row=0,
-            column=2,
-            sticky="w"
-        )
-        ttk.Label(
-            stats,
-            textvariable=self.speed_var
-        ).grid(
-            row=0,
-            column=3,
-            sticky="w",
-            padx=(8, 20)
-        )
-
-        ttk.Label(
-            stats,
-            text="Transfers:"
-        ).grid(
-            row=1,
-            column=0,
-            sticky="w"
-        )
-        ttk.Label(
-            stats,
-            textvariable=self.transfers_var
-        ).grid(
-            row=1,
-            column=1,
-            sticky="w",
-            padx=(8, 20)
-        )
-
-        ttk.Label(
-            stats,
-            text="Cache:"
-        ).grid(
-            row=1,
-            column=2,
-            sticky="w"
-        )
-        ttk.Label(
-            stats,
-            textvariable=self.cache_var
-        ).grid(
-            row=1,
-            column=3,
-            sticky="w",
-            padx=(8, 20)
-        )
-
-        button_frame = ttk.Frame(main)
-
-        button_frame.grid(
             row=4,
             column=0,
-            columnspan=2,
-            pady=20
+            sticky="w",
+            pady=(0, 6),
         )
 
-        ttk.Button(
-            button_frame,
-            text="Install Rclone",
-            command=self.install_rclone
-        ).pack(
-            side="left",
-            padx=5
+        self.drive_entry = tk.Entry(
+            form_card,
+            width=8
+        )
+        self.drive_entry.grid(
+            row=5,
+            column=0,
+            sticky="w",
+            pady=(0, 4)
+        )
+        AppTheme.style_entry(
+            self.drive_entry,
+            self.fonts
         )
 
-        ttk.Button(
-            button_frame,
-            text="Install WinFsp",
-            command=self.install_winfsp
-        ).pack(
-            side="left",
-            padx=5
+        form_card.columnconfigure(0, weight=1)
+
+        stats_outer, stats_card = AppTheme.build_card(
+            body,
+            "Mount Status"
+        )
+        stats_outer.grid(
+            row=1,
+            column=0,
+            sticky="ew",
+            pady=(0, AppTheme.SECTION_PADY),
         )
 
-        ttk.Button(
-            button_frame,
-            text="Authenticate",
-            command=self.authenticate
-        ).pack(
-            side="left",
-            padx=5
+        self.status_label = tk.Label(
+            stats_card,
+            text="Unmounted",
+            bg=AppTheme.CARD,
+            fg=AppTheme.TEXT_MUTED,
+            font=self.fonts["stat_value"],
+            anchor="w",
+        )
+        self.speed_label = tk.Label(
+            stats_card,
+            text="0 B/s",
+            bg=AppTheme.CARD,
+            fg=AppTheme.DRIVE_BLUE,
+            font=self.fonts["stat_value"],
+            anchor="w",
+        )
+        self.transfers_label = tk.Label(
+            stats_card,
+            text="0",
+            bg=AppTheme.CARD,
+            fg=AppTheme.DRIVE_BLUE,
+            font=self.fonts["stat_value"],
+            anchor="w",
+        )
+        self.cache_label = tk.Label(
+            stats_card,
+            text="0 files",
+            bg=AppTheme.CARD,
+            fg=AppTheme.DRIVE_BLUE,
+            font=self.fonts["stat_value"],
+            anchor="w",
         )
 
-        ttk.Button(
-            button_frame,
-            text="Mount",
-            command=self.mount
-        ).pack(
-            side="left",
-            padx=5
+        stat_pad = (0, 6)
+        AppTheme.make_label(
+            stats_card,
+            "State",
+        ).grid(
+            row=0, column=0, sticky="w", pady=stat_pad
+        )
+        self.status_label.grid(
+            row=1, column=0, sticky="w", pady=(0, 12)
+        )
+        AppTheme.make_label(
+            stats_card,
+            "Speed",
+        ).grid(
+            row=0, column=1, sticky="w",
+            padx=(28, 0), pady=stat_pad
+        )
+        self.speed_label.grid(
+            row=1, column=1, sticky="w",
+            padx=(28, 0), pady=(0, 12)
+        )
+        AppTheme.make_label(
+            stats_card,
+            "Transfers",
+        ).grid(
+            row=2, column=0, sticky="w", pady=stat_pad
+        )
+        self.transfers_label.grid(
+            row=3, column=0, sticky="w", pady=(0, 4)
+        )
+        AppTheme.make_label(
+            stats_card,
+            "Cache",
+        ).grid(
+            row=2, column=1, sticky="w",
+            padx=(28, 0), pady=stat_pad
+        )
+        self.cache_label.grid(
+            row=3, column=1, sticky="w",
+            padx=(28, 0), pady=(0, 4)
         )
 
-        ttk.Button(
-            button_frame,
-            text="Unmount",
-            command=self.unmount
-        ).pack(
-            side="left",
-            padx=5
+        actions_outer, actions_card = (
+            AppTheme.build_card(
+                body,
+                "Actions"
+            )
+        )
+        actions_outer.grid(
+            row=2,
+            column=0,
+            sticky="ew",
+            pady=(0, AppTheme.SECTION_PADY),
         )
 
-        ttk.Button(
-            button_frame,
-            text="Open Folder",
-            command=self.open_folder
+        button_frame = AppTheme.make_frame(
+            actions_card
+        )
+        button_frame.pack(fill="x")
+
+        row_one = AppTheme.make_frame(button_frame)
+        row_one.pack(fill="x", pady=(0, 8))
+
+        row_two = AppTheme.make_frame(button_frame)
+        row_two.pack(fill="x")
+
+        AppTheme.make_button(
+            row_one,
+            "Install Rclone",
+            self.install_rclone,
         ).pack(
             side="left",
-            padx=5
+            padx=(0, 10),
+        )
+
+        AppTheme.make_button(
+            row_one,
+            "Install WinFsp",
+            self.install_winfsp,
+        ).pack(
+            side="left",
+            padx=(0, 10),
+        )
+
+        AppTheme.make_button(
+            row_one,
+            "Authenticate",
+            self.authenticate,
+            variant="accent",
+        ).pack(
+            side="left",
+            padx=(0, 10),
+        )
+
+        AppTheme.make_button(
+            row_two,
+            "Mount",
+            self.mount,
+            variant="primary",
+        ).pack(
+            side="left",
+            padx=(0, 10),
+        )
+
+        AppTheme.make_button(
+            row_two,
+            "Unmount",
+            self.unmount,
+            variant="danger",
+        ).pack(
+            side="left",
+            padx=(0, 10),
+        )
+
+        AppTheme.make_button(
+            row_two,
+            "Open Folder",
+            self.open_folder,
+            variant="accent",
+        ).pack(
+            side="left",
+            padx=(0, 10),
+        )
+
+        footer = tk.Frame(
+            body,
+            bg=AppTheme.BG,
+        )
+        footer.grid(
+            row=3,
+            column=0,
+            sticky="ew",
+            pady=(0, AppTheme.SECTION_PADY),
         )
 
         self.startup_var = tk.BooleanVar()
 
         ttk.Checkbutton(
-            main,
-            text="Mount at startup",
+            footer,
+            text="Mount at Windows startup",
             variable=self.startup_var
-        ).grid(
-            row=5,
+        ).pack(side="left")
+
+        AppTheme.make_button(
+            footer,
+            "Save Settings",
+            self.save_settings,
+            variant="accent",
+        ).pack(side="right")
+
+        log_outer, log_card = AppTheme.build_card(
+            body,
+            "Live Logs"
+        )
+        log_outer.grid(
+            row=4,
             column=0,
-            sticky="w"
+            sticky="nsew",
         )
 
-        ttk.Button(
-            main,
-            text="Save Settings",
-            command=self.save_settings
-        ).grid(
-            row=5,
-            column=1,
-            sticky="e"
+        log_inner = tk.Frame(
+            log_card,
+            bg=AppTheme.CARD,
+            height=240,
         )
+        log_inner.pack(fill="both", expand=True)
+        log_inner.pack_propagate(True)
+        log_inner.columnconfigure(0, weight=1)
+        log_inner.rowconfigure(0, weight=1)
 
-        self.log = scrolledtext.ScrolledText(
-            main,
-            height=22
+        self.log = tk.Text(
+            log_inner,
+            height=14,
+            wrap="word",
+            state="normal",
+            undo=False,
         )
+        AppTheme.style_log(self.log, self.fonts)
+        self.log.insert(
+            tk.END,
+            "Waiting for log messages...\n",
+        )
+        self.log.configure(state="disabled")
 
+        scrollbar = ttk.Scrollbar(
+            log_inner,
+            command=self.log.yview
+        )
+        self.log.configure(
+            yscrollcommand=scrollbar.set
+        )
         self.log.grid(
-            row=6,
+            row=0,
             column=0,
-            columnspan=2,
             sticky="nsew"
         )
-
-        main.columnconfigure(1, weight=1)
-        main.rowconfigure(6, weight=1)
-
-    def apply_theme(self):
-
-        try:
-            import sv_ttk
-            sv_ttk.set_theme("dark")
-            logger.info("Dark theme enabled.")
-        except Exception:
-            logger.info("Default theme in use.")
+        scrollbar.grid(
+            row=0,
+            column=1,
+            sticky="ns",
+            padx=(6, 0)
+        )
 
     def write_log(self, text):
 
-        def append():
-            self.log.insert(
-                tk.END,
-                text + "\n"
-            )
-            self.log.see(tk.END)
+        self._log_pending.append(text)
 
-        self.after(0, append)
+        if (
+            threading.current_thread()
+            is threading.main_thread()
+        ):
+            self._flush_log_buffer()
+        else:
+            self.post_ui(self._flush_log_buffer)
+
+    def _flush_log_buffer(self):
+
+        if not self._log_pending:
+            return
+
+        try:
+            if not self.log.winfo_exists():
+                return
+        except tk.TclError:
+            return
+
+        chunk = (
+            "\n".join(self._log_pending)
+            + "\n"
+        )
+        self._log_pending.clear()
+
+        self.log.configure(state="normal")
+        self.log.insert(tk.END, chunk)
+
+        line_count = int(
+            self.log.index("end-1c").split(".")[0]
+        )
+        if line_count > LOG_MAX_LINES:
+            self.log.delete(
+                "1.0",
+                f"{line_count - LOG_MAX_LINES}.0"
+            )
+
+        self.log.see(tk.END)
+        self.log.configure(state="disabled")
 
     def ensure_managers(self):
 
@@ -384,11 +609,10 @@ class App(tk.Tk):
 
         return exe
 
-    def normalized_drive(self):
+    def normalized_drive_from(self, value):
 
         drive = (
-            self.drive_var.get()
-            .strip()
+            value.strip()
             .upper()
             .replace(":", "")
         )
@@ -406,9 +630,9 @@ class App(tk.Tk):
 
         return drive
 
-    def remote_name(self):
+    def remote_name_from(self, value):
 
-        name = self.remote_var.get().strip()
+        name = value.strip()
 
         if not name:
             raise ValueError(
@@ -451,90 +675,173 @@ class App(tk.Tk):
             )
             logger.info("Startup disabled.")
 
-    def restore_mount_session(self):
+    def _restore_mount_session_async(self):
 
-        session = (
-            self.session_store.load_active()
+        def task():
+            session = (
+                self.session_store.load_active()
+            )
+            if not session:
+                return
+
+            try:
+                self.ensure_managers()
+                self.post_ui(
+                    self._attach_restored_session,
+                    session
+                )
+            except Exception as ex:
+                logger.warning(
+                    "Could not restore mount "
+                    "session: %s",
+                    ex
+                )
+                self.session_store.clear()
+
+        threading.Thread(
+            target=task,
+            daemon=True
+        ).start()
+
+    def _attach_restored_session(self, session):
+
+        self.mount_manager.attach_session(session)
+        self.mounting = True
+        self.remote_entry.delete(0, tk.END)
+        self.remote_entry.insert(
+            0,
+            session.remote_name
         )
-
-        if not session:
-            return
-
-        try:
-            self.ensure_managers()
-            self.mount_manager.attach_session(
-                session
-            )
-            self.mounting = True
-            self.remote_var.set(
-                session.remote_name
-            )
-            self.drive_var.set(
-                session.drive_letter
-            )
-            logger.info(
-                "Reconnected to active mount "
-                "(pid=%s).",
-                session.pid
-            )
-            self.start_stats_polling()
-        except Exception as ex:
-            logger.warning(
-                "Could not restore mount "
-                "session: %s",
-                ex
-            )
-            self.session_store.clear()
+        self.drive_entry.delete(0, tk.END)
+        self.drive_entry.insert(
+            0,
+            session.drive_letter
+        )
+        logger.info(
+            "Reconnected to active mount "
+            "(pid=%s).",
+            session.pid
+        )
+        self.start_stats_polling()
 
     def start_stats_polling(self):
 
-        if self.stats_job:
-            self.after_cancel(self.stats_job)
+        if self._stats_polling:
+            return
 
-        self.poll_stats()
+        self._stats_polling = True
+        self._schedule_stats_poll()
 
     def stop_stats_polling(self):
+
+        self._stats_polling = False
+        self._last_stats = None
 
         if self.stats_job:
             self.after_cancel(self.stats_job)
             self.stats_job = None
 
-        self.status_var.set("Unmounted")
-        self.speed_var.set("0 B/s")
-        self.transfers_var.set("0")
-        self.cache_var.set("0 files")
+        self.status_label.configure(
+            text="Unmounted",
+            fg=AppTheme.TEXT_MUTED,
+        )
+        self.speed_label.configure(text="0 B/s")
+        self.transfers_label.configure(text="0")
+        self.cache_label.configure(text="0 files")
 
-    def poll_stats(self):
+    def _schedule_stats_poll(self):
 
         if (
-            self.mount_manager
-            and self.mount_manager.is_running()
+            not self._stats_polling
+            or self._shutting_down
         ):
+            return
+
+        self.stats_job = self.after(
+            STATS_POLL_MS,
+            self._poll_stats_async
+        )
+
+    def _poll_stats_async(self):
+
+        if (
+            not self._stats_polling
+            or self._shutting_down
+        ):
+            return
+
+        def worker():
+
+            if not self.mount_manager:
+                self.post_ui(self._on_mount_stopped)
+                return
+
+            if not self.mount_manager.is_process_alive():
+                self.post_ui(self._on_mount_stopped)
+                return
+
             summary = (
                 self.mount_manager
                 .get_stats_summary()
             )
-            self.status_var.set(
+            self.post_ui(
+                self._update_stats_ui,
+                summary
+            )
+
+        threading.Thread(
+            target=worker,
+            daemon=True
+        ).start()
+
+        self._schedule_stats_poll()
+
+    def _update_stats_ui(self, summary):
+
+        if self._shutting_down:
+            return
+
+        snapshot = (
+            summary["mounted"],
+            summary["speed"],
+            summary["transfers"],
+            summary["cache"],
+        )
+
+        if snapshot == self._last_stats:
+            return
+
+        self._last_stats = snapshot
+
+        self.status_label.configure(
+            text=(
                 "Mounted"
                 if summary["mounted"]
                 else "Unmounted"
-            )
-            self.speed_var.set(summary["speed"])
-            self.transfers_var.set(
-                str(summary["transfers"])
-            )
-            self.cache_var.set(summary["cache"])
-        else:
-            if self.mounting:
-                self.mounting = False
-                self.session_store.clear()
-            self.stop_stats_polling()
-            return
-
-        self.stats_job = self.after(
-            2000,
-            self.poll_stats
+            ),
+            fg=(
+                AppTheme.GREEN
+                if summary["mounted"]
+                else AppTheme.TEXT_MUTED
+            ),
         )
+        self.speed_label.configure(
+            text=summary["speed"]
+        )
+        self.transfers_label.configure(
+            text=str(summary["transfers"])
+        )
+        self.cache_label.configure(
+            text=summary["cache"]
+        )
+
+    def _on_mount_stopped(self):
+
+        if self.mounting:
+            self.mounting = False
+            self.session_store.clear()
+
+        self.stop_stats_polling()
 
     def stream_mount_logs(self):
 
@@ -549,11 +856,14 @@ class App(tk.Tk):
         for line in stream:
             line = line.strip()
             if line:
-                logger.info("[rclone] %s", line)
+                logger.debug(
+                    "[rclone] %s",
+                    line
+                )
 
         exit_code = self.mount_process.poll()
         self.mounting = False
-        self.stop_stats_polling()
+        self.post_ui(self.stop_stats_polling)
 
         if exit_code is None:
             logger.info(
@@ -576,6 +886,14 @@ class App(tk.Tk):
 
         def task():
             try:
+                existing = self.rclone.find_in_tools()
+                if existing:
+                    logger.info(
+                        "Rclone is already installed: %s",
+                        existing,
+                    )
+                    return
+
                 logger.info("Installing rclone...")
                 exe = self.rclone.ensure()
                 logger.info("Installed: %s", exe)
@@ -584,12 +902,10 @@ class App(tk.Tk):
                     "Rclone install failed: %s",
                     ex
                 )
-                self.after(
-                    0,
-                    lambda: messagebox.showerror(
-                        "Rclone Error",
-                        str(ex)
-                    )
+                self.post_ui(
+                    messagebox.showerror,
+                    "Rclone Error",
+                    str(ex)
                 )
 
         threading.Thread(
@@ -618,12 +934,10 @@ class App(tk.Tk):
                     "WinFsp install failed: %s",
                     ex
                 )
-                self.after(
-                    0,
-                    lambda: messagebox.showerror(
-                        "WinFsp Error",
-                        str(ex)
-                    )
+                self.post_ui(
+                    messagebox.showerror,
+                    "WinFsp Error",
+                    str(ex)
                 )
 
         threading.Thread(
@@ -633,16 +947,21 @@ class App(tk.Tk):
 
     def authenticate(self):
 
+        folder_input = self.folder_entry.get()
+        remote_input = self.remote_entry.get()
+
         def task():
             try:
                 self.ensure_managers()
 
                 folder_id = (
                     DriveParser.extract_folder_id(
-                        self.folder_var.get()
+                        folder_input
                     )
                 )
-                name = self.remote_name()
+                name = self.remote_name_from(
+                    remote_input
+                )
 
                 ready = (
                     self.auth_manager.authenticate(
@@ -666,12 +985,10 @@ class App(tk.Tk):
                     "Authentication failed: %s",
                     ex
                 )
-                self.after(
-                    0,
-                    lambda: messagebox.showerror(
-                        "Authentication Error",
-                        str(ex)
-                    )
+                self.post_ui(
+                    messagebox.showerror,
+                    "Authentication Error",
+                    str(ex)
                 )
 
         threading.Thread(
@@ -687,6 +1004,10 @@ class App(tk.Tk):
             )
             return
 
+        folder_input = self.folder_entry.get()
+        drive_input = self.drive_entry.get()
+        remote_input = self.remote_entry.get()
+
         def task():
             try:
                 self.ensure_managers()
@@ -698,13 +1019,17 @@ class App(tk.Tk):
 
                 folder_id = (
                     DriveParser.extract_folder_id(
-                        self.folder_var.get()
+                        folder_input
                     )
                 )
                 drive_letter = (
-                    self.normalized_drive()
+                    self.normalized_drive_from(
+                        drive_input
+                    )
                 )
-                name = self.remote_name()
+                name = self.remote_name_from(
+                    remote_input
+                )
 
                 if not self.auth_manager.ensure_remote_ready(
                     name,
@@ -738,8 +1063,7 @@ class App(tk.Tk):
                     drive_letter
                 )
 
-                self.after(
-                    0,
+                self.post_ui(
                     self.start_stats_polling
                 )
                 self.stream_mount_logs()
@@ -750,12 +1074,10 @@ class App(tk.Tk):
                     "Mount failed: %s",
                     ex
                 )
-                self.after(
-                    0,
-                    lambda: messagebox.showerror(
-                        "Mount Error",
-                        str(ex)
-                    )
+                self.post_ui(
+                    messagebox.showerror,
+                    "Mount Error",
+                    str(ex)
                 )
 
         threading.Thread(
@@ -765,22 +1087,30 @@ class App(tk.Tk):
 
     def unmount(self):
 
-        if not self.mount_manager:
-            logger.info("Nothing to unmount.")
-            return
+        def task():
+            if not self.mount_manager:
+                logger.info("Nothing to unmount.")
+                return
 
-        self.mount_manager.unmount()
-        self.mounting = False
-        self.mount_process = None
-        self.session_store.clear()
-        self.stop_stats_polling()
-        logger.info("Unmounted.")
+            self.mount_manager.unmount()
+            self.mounting = False
+            self.mount_process = None
+            self.session_store.clear()
+            self.post_ui(self.stop_stats_polling)
+            logger.info("Unmounted.")
+
+        threading.Thread(
+            target=task,
+            daemon=True
+        ).start()
 
     def open_folder(self):
 
         try:
             drive = (
-                self.normalized_drive()
+                self.normalized_drive_from(
+                    self.drive_entry.get()
+                )
                 + ":\\"
             )
 
@@ -803,9 +1133,15 @@ class App(tk.Tk):
     def save_settings(self):
 
         data = {
-            "remote_name": self.remote_var.get(),
-            "folder_id": self.folder_var.get(),
-            "drive_letter": self.drive_var.get(),
+            "remote_name": (
+                self.remote_entry.get()
+            ),
+            "folder_id": (
+                self.folder_entry.get()
+            ),
+            "drive_letter": (
+                self.drive_entry.get()
+            ),
             "mount_on_startup": (
                 self.startup_var.get()
             ),
@@ -830,19 +1166,22 @@ class App(tk.Tk):
 
     def load_settings(self):
 
-        self.remote_var.set(
+        self.remote_entry.insert(
+            0,
             self.config_data.get(
                 "remote_name",
                 ""
             )
         )
-        self.folder_var.set(
+        self.folder_entry.insert(
+            0,
             self.config_data.get(
                 "folder_id",
                 ""
             )
         )
-        self.drive_var.set(
+        self.drive_entry.insert(
+            0,
             self.config_data.get(
                 "drive_letter",
                 "X"
@@ -871,13 +1210,10 @@ class App(tk.Tk):
                     f"{result['current_version']})"
                 )
                 logger.info(message)
-                self.after(
-                    0,
-                    lambda: messagebox.showinfo(
-                        "Update Available",
-                        message,
-                        parent=self
-                    )
+                self.post_ui(
+                    messagebox.showinfo,
+                    "Update Available",
+                    message
                 )
 
                 url = result.get("url")
@@ -889,33 +1225,71 @@ class App(tk.Tk):
             daemon=True
         ).start()
 
-    def start_tray(self):
-
-        self.tray = TrayManager(
-            self,
-            on_show=self.show_window,
-            on_mount=self.mount,
-            on_unmount=self.unmount,
-            on_open_drive=self.open_folder,
-            on_exit=self.exit_app
-        )
-        self.tray.start()
-
-    def show_window(self):
-
-        self.after(0, self.deiconify)
-        self.after(0, self.lift)
-
     def on_close(self):
 
-        self.withdraw()
+        self.shutdown()
 
-    def exit_app(self):
+    def shutdown(self):
 
-        if self.mount_manager:
-            self.mount_manager.unmount()
+        if self._shutting_down:
+            return
 
-        if self.tray:
-            self.tray.stop()
+        self._shutting_down = True
+        self._shutdown_finished = False
+        logger.info("Shutting down.")
 
-        self.destroy()
+        self._stats_polling = False
+
+        if self.stats_job:
+            try:
+                self.after_cancel(self.stats_job)
+            except Exception:
+                pass
+            self.stats_job = None
+
+        self._log_pending.clear()
+
+        def task():
+            try:
+                if self.mount_manager:
+                    self.mount_manager.unmount()
+            except Exception as ex:
+                logger.warning(
+                    "Unmount during shutdown "
+                    "failed: %s",
+                    ex
+                )
+
+            self.mounting = False
+            self.mount_process = None
+            self.post_ui(self._finish_shutdown)
+
+        threading.Thread(
+            target=task,
+            daemon=True
+        ).start()
+
+        self.after(
+            1500,
+            self._finish_shutdown
+        )
+
+    def _finish_shutdown(self):
+
+        if (
+            self._shutdown_finished
+            or not self._shutting_down
+        ):
+            return
+
+        self._shutdown_finished = True
+
+        try:
+            self.quit()
+        except Exception:
+            pass
+
+        try:
+            self.destroy()
+        except Exception:
+            pass
