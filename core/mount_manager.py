@@ -81,7 +81,7 @@ class MountManager:
         response = requests.post(
             f"{self.rc_url}/{endpoint}",
             json=payload or {},
-            timeout=2
+            timeout=1
         )
         response.raise_for_status()
         return response.json()
@@ -114,7 +114,7 @@ class MountManager:
 
     def get_stats_summary(self):
 
-        if not self.is_running():
+        if not self.is_process_alive():
             return {
                 "mounted": False,
                 "speed": "0 B/s",
@@ -168,7 +168,7 @@ class MountManager:
 
         return f"{size:.1f} TiB"
 
-    def is_running(self):
+    def is_process_alive(self):
 
         if (
             self.process is not None
@@ -183,6 +183,13 @@ class MountManager:
             return MountSessionStore.is_process_running(
                 self.attached_pid
             )
+
+        return False
+
+    def is_running(self):
+
+        if self.is_process_alive():
+            return True
 
         return self.get_core_stats() is not None
 

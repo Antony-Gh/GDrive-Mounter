@@ -16,8 +16,14 @@ RCLONE_DIR = "tools/rclone"
 
 WINFSP_URL = "https://winfsp.dev/rel/winfsp-latest.msi"
 
+WINFSP_API = (
+    "https://api.github.com/repos/"
+    "winfsp/winfsp/releases/latest"
+)
+
 RCLONE_API = (
-    "https://api.github.com/repos/rclone/rclone/releases/latest"
+    "https://api.github.com/repos/"
+    "rclone/rclone/releases/latest"
 )
 
 APP_GITHUB_API = (

@@ -4,9 +4,9 @@ from pathlib import Path
 from constants import SETTINGS_FILE
 
 DEFAULT_CONFIG = {
-    "remote_name": "matlab-public",
+    "remote_name": "public-drive-folder",
     "folder_id": "",
-    "drive_letter": "X",
+    "drive_letter": "W",
     "rclone_path": "",
     "mount_on_startup": False
 }

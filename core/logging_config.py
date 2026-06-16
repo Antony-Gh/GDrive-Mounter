@@ -11,13 +11,13 @@ class GUILogHandler(logging.Handler):
         super().__init__()
 
         self.callback = callback
+        self.setLevel(logging.INFO)
 
     def emit(self, record):
 
         try:
-            self.callback(
-                self.format(record)
-            )
+            msg = self.format(record)
+            self.callback(msg)
         except Exception:
             self.handleError(record)
 
